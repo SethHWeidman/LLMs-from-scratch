@@ -33,7 +33,7 @@ def create_demo_batch() -> torch.Tensor:
     return inputs
 
 
-class CausalAttention(nn.Module):
+class SingleHeadAttention(nn.Module):
     def __init__(
         self,
         d_in: int,
@@ -57,6 +57,11 @@ class CausalAttention(nn.Module):
         queries = self.W_query(x)
         values = self.W_value(x)
 
+        # queries, keys: (b, num_tokens, d_out)
+        # keys.transpose(1, 2): (b, d_out, num_tokens)
+        # This computes Q K^T with shape (b, num_tokens, num_tokens) so that
+        #   attn_scores[b, i, j] = q_i · k_j
+        # and each row i corresponds to query token i.
         attn_scores = queries @ keys.transpose(1, 2)
         mask_bool = self.mask.bool()[:num_tokens, :num_tokens]
         attn_scores.masked_fill_(mask_bool, -torch.inf)
@@ -109,6 +114,11 @@ class MultiHeadAttention(nn.Module):
         queries = queries.transpose(1, 2)
         values = values.transpose(1, 2)
 
+        # queries, keys: (b, num_heads, num_tokens, head_dim)
+        # keys.transpose(2, 3): (b, num_heads, head_dim, num_tokens)
+        # Batched Q K^T per (batch, head), yielding
+        #   attn_scores: (b, num_heads, num_tokens, num_tokens)
+        # with attn_scores[b, h, i, j] = q_i · k_j.
         attn_scores = queries @ keys.transpose(2, 3)
         mask_bool = self.mask.bool()[:num_tokens, :num_tokens]
         attn_scores.masked_fill_(mask_bool, -torch.inf)
@@ -135,10 +145,10 @@ def run_demo() -> None:
         f"(batch={batch_size}, tokens={seq_len}, embedding_dim={d_in})"
     )
 
-    ca = CausalAttention(d_in, d_out, context_length, dropout=0.0)
+    ca = SingleHeadAttention(d_in, d_out, context_length, dropout=0.0)
     ca_context = ca(batch)
     print(
-        "CausalAttention output shape:"
+        "SingleHeadAttention output shape:"
         f" {ca_context.shape} (batch={ca_context.shape[0]},"
         f" tokens={ca_context.shape[1]},"
         f" features={ca_context.shape[2]} = d_out({d_out}))"
