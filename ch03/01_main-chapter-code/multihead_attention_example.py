@@ -142,8 +142,8 @@ class MultiHeadAttention(nn.Module):
         context_vectors = (
             context_vectors.transpose(1, 2).contiguous().view(b, num_tokens, self.d_out)
         )
-        context_vectors = self.out_proj(context_vectors)
-        return context_vectors
+        output_vectors = self.out_proj(context_vectors)
+        return output_vectors
 
 
 def run_demo() -> None:
