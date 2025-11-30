@@ -110,6 +110,10 @@ class MultiHeadAttention(nn.Module):
         queries = queries.view(b, num_tokens, self.num_heads, self.head_dim)
         values = values.view(b, num_tokens, self.num_heads, self.head_dim)
 
+        # the code below sets up the remainder of the computations to be done
+        # "head-wise"; each head does its own operations with keys, queries, and values.
+        # Last two dimensions of each of these Tensors are now [num_tokens,
+        # self.head_dim]
         keys = keys.transpose(1, 2)
         queries = queries.transpose(1, 2)
         values = values.transpose(1, 2)
@@ -123,13 +127,23 @@ class MultiHeadAttention(nn.Module):
         mask_bool = self.mask.bool()[:num_tokens, :num_tokens]
         attn_scores.masked_fill_(mask_bool, -torch.inf)
 
+        # Softmax over the last dimension means that for each (batch, head, query i),
+        # attn_scores[b, h, i, :] is normalized into a per-head distribution over keys j.
         attn_weights = torch.softmax(attn_scores / keys.shape[-1] ** 0.5, dim=-1)
         attn_weights = self.dropout(attn_weights)
 
-        context_vec = (attn_weights @ values).transpose(1, 2)
-        context_vec = context_vec.contiguous().view(b, num_tokens, self.d_out)
-        context_vec = self.out_proj(context_vec)
-        return context_vec
+        # at this point, we have an "num_tokens x self.head_dim" matrix of context
+        # vectors in each head. `context_vectors` is [b, self.num_heads, num_tokens,
+        # self.head_dim]
+        context_vectors = attn_weights @ values
+
+        # finally combine the results from all the heads. `.transpose(1, 2)` changes
+        # `context_vectors` to have shape [b, num_tokens, self.num_heads, self.head_dim]
+        context_vectors = (
+            context_vectors.transpose(1, 2).contiguous().view(b, num_tokens, self.d_out)
+        )
+        context_vectors = self.out_proj(context_vectors)
+        return context_vectors
 
 
 def run_demo() -> None:
