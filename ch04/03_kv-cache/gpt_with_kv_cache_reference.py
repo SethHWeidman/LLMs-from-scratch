@@ -43,84 +43,89 @@ class MultiHeadAttention(nn.Module):
         self.register_buffer("cache_k", None, persistent=False)
         self.register_buffer("cache_v", None, persistent=False)
 
-    def forward(self, x: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
-        b, num_tokens, _ = x.shape
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, num_new_tokens, _ = x.shape
 
-        keys_new = self.W_key(x)  # Shape: (b, num_tokens, d_out)
+        keys_new = self.W_key(x)  # Shape: (b, num_new_tokens, d_out)
         values_new = self.W_value(x)
         queries = self.W_query(x)
 
-        # We implicitly split the matrix by adding a `num_heads` dimension
-        # Unroll last dim: (b, num_tokens, d_out) -> (b, num_tokens, num_heads, head_dim)
-        keys_new = keys_new.view(b, num_tokens, self.num_heads, self.head_dim)
-        values_new = values_new.view(b, num_tokens, self.num_heads, self.head_dim)
-        queries = queries.view(b, num_tokens, self.num_heads, self.head_dim)
+        # We implicitly split the matrix by adding a `num_heads` dimension Unroll last
+        # dim: (b, num_new_tokens, d_out) -> (b, num_new_tokens, num_heads, head_dim)
+        keys_new = keys_new.view(b, num_new_tokens, self.num_heads, self.head_dim)
+        values_new = values_new.view(b, num_new_tokens, self.num_heads, self.head_dim)
+        queries = queries.view(b, num_new_tokens, self.num_heads, self.head_dim)
 
-        # Transpose: (b, num_tokens, num_heads, head_dim) -> (b, num_heads, num_tokens,
-        # head_dim)
+        # Transpose: (b, num_new_tokens, num_heads, head_dim) -> (b, num_heads,
+        # num_new_tokens, head_dim)
         keys_new = keys_new.transpose(1, 2)
         values_new = values_new.transpose(1, 2)
         queries = queries.transpose(1, 2)
 
-        if use_cache:
-            if self.cache_k is None or self.cache_k.size(0) != b:
-                self.cache_k = torch.zeros(
-                    b,
-                    self.num_heads,
-                    self.kv_window_size,
-                    self.head_dim,
-                    device=x.device,
-                )
-                self.cache_v = torch.zeros_like(self.cache_k)
-                self.ptr_cur = 0  # pointer to next free slot
+        # Always use the KV cache path: append the new keys/values into the
+        # fixed-size sliding window buffer, dropping the oldest entries if
+        # necessary.
+        if self.cache_k is None or self.cache_k.size(0) != b:
+            self.cache_k = torch.zeros(
+                b, self.num_heads, self.kv_window_size, self.head_dim, device=x.device
+            )
+            self.cache_v = torch.zeros_like(self.cache_k)
+            self.ptr_cur = 0  # pointer to next free slot
 
-            # if incoming chunk would overflow discard oldest tokens
-            if self.ptr_cur + num_tokens > self.kv_window_size:
-                overflow = self.ptr_cur + num_tokens - self.kv_window_size
-                # shift everything left by `overflow` (cheap view-copy)
-                # (drop the oldest `overflow` timesteps to make room)
-                self.cache_k[:, :, :-overflow, :] = self.cache_k[
-                    :, :, overflow:, :
-                ].clone()
-                self.cache_v[:, :, :-overflow, :] = self.cache_v[
-                    :, :, overflow:, :
-                ].clone()
-                # pointer after shift
-                self.ptr_cur -= overflow
+        # if incoming chunk would overflow discard oldest tokens
+        if self.ptr_cur + num_new_tokens > self.kv_window_size:
+            overflow = self.ptr_cur + num_new_tokens - self.kv_window_size
+            # shift everything left by `overflow` (cheap view-copy)
+            # (drop the oldest `overflow` timesteps to make room)
+            self.cache_k[:, :, :-overflow, :] = self.cache_k[:, :, overflow:, :].clone()
+            self.cache_v[:, :, :-overflow, :] = self.cache_v[:, :, overflow:, :].clone()
+            # pointer after shift
+            self.ptr_cur -= overflow
 
-            # Write the new keys/values into the cache at positions [ptr_cur, ptr_cur +
-            # num_tokens) along the time dimension.
-            # shapes:
-            #   cache_k:  (b, n_heads, kv_window_size, head_dim)
-            #   keys_new: (b, n_heads, num_tokens, head_dim)
-            self.cache_k[:, :, self.ptr_cur : self.ptr_cur + num_tokens, :] = keys_new
-            self.cache_v[:, :, self.ptr_cur : self.ptr_cur + num_tokens, :] = values_new
-            self.ptr_cur += num_tokens
+        # Write the new keys/values into the cache at positions [ptr_cur, ptr_cur +
+        # num_new_tokens) along the time dimension.
+        # shapes:
+        #   cache_k:  (b, n_heads, kv_window_size, head_dim)
+        #   keys_new: (b, n_heads, num_new_tokens, head_dim)
+        self.cache_k[:, :, self.ptr_cur : self.ptr_cur + num_new_tokens, :] = keys_new
+        self.cache_v[:, :, self.ptr_cur : self.ptr_cur + num_new_tokens, :] = values_new
+        self.ptr_cur += num_new_tokens
 
-            keys = self.cache_k[:, :, : self.ptr_cur, :]
-            values = self.cache_v[:, :, : self.ptr_cur, :]
-        else:
-            keys, values = keys_new, values_new
-            self.ptr_cur = 0  # keep pointer sane if you interleave modes
+        keys = self.cache_k[:, :, : self.ptr_cur, :]
+        values = self.cache_v[:, :, : self.ptr_cur, :]
 
         # Compute scaled dot-product attention (aka self-attention) with a causal mask
         attn_scores = queries @ keys.transpose(2, 3)  # Dot product for each head
 
-        K = attn_scores.size(-1)
+        # num_keys is the total number of keys this query can attend to: cached
+        # keys from previous steps plus the current `num_tokens` keys.
+        num_keys = attn_scores.size(-1)
 
-        if num_tokens == K:
-            # No cache → use the pre‑baked triangular mask slice
+        if num_new_tokens == num_keys:
+            # No cache case: queries and keys span the same sequence, so we can just use
+            # the standard upper‑triangular causal mask where positions strictly above
+            # the main diagonal are masked out.
             causal_mask = torch.triu(
-                torch.ones(num_tokens, K, device=x.device, dtype=torch.bool), diagonal=1
+                torch.ones(num_new_tokens, num_keys, device=x.device, dtype=torch.bool),
+                diagonal=1,
             )
         else:
-            # Cached: need to offset the diagonal by (K − num_tokens)
-            # number of tokens already in cache before this chunk
-            offset = K - num_tokens
-            # (num_tokens, 1)
-            row_idx = torch.arange(num_tokens, device=x.device).unsqueeze(1)
-            col_idx = torch.arange(K, device=x.device).unsqueeze(0)  # (1, K)
-            causal_mask = row_idx + offset < col_idx  # True where j > i+offset
+            # Cached case: we only have `num_tokens` fresh queries, but there are
+            # `num_keys` keys in total. The first (num_keys - num_tokens) keys come
+            # from earlier timesteps stored in the KV cache, so each query i in this
+            # chunk corresponds to a *global* position (offset + i), where offset =
+            # number of cached tokens before this chunk.
+            #
+            # A key at column j is in the "future" of query (offset + i) if
+            # j > offset + i, which we encode via the inequality below.
+            offset = num_keys - num_new_tokens
+            # Row indices i = 0..num_new_tokens-1, shaped (num_new_tokens, 1)
+            row_idx = torch.arange(num_new_tokens, device=x.device).unsqueeze(1)
+            # Column indices j = 0..num_keys-1, shaped (1, num_keys)
+            col_idx = torch.arange(num_keys, device=x.device).unsqueeze(0)
+            # True wherever j > offset + i, i.e., where the key would be a
+            # "future" position for this query and must be masked out.
+            causal_mask = row_idx + offset < col_idx
 
         # Use the mask to fill attention scores
         attn_scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), -torch.inf)
@@ -132,7 +137,7 @@ class MultiHeadAttention(nn.Module):
         context_vec = (attn_weights @ values).transpose(1, 2)
 
         # Combine heads, where self.d_out = self.num_heads * self.head_dim
-        context_vec = context_vec.contiguous().view(b, num_tokens, self.d_out)
+        context_vec = context_vec.contiguous().view(b, num_new_tokens, self.d_out)
         context_vec = self.out_proj(context_vec)  # optional projection
 
         return context_vec
@@ -199,23 +204,19 @@ class TransformerBlock(nn.Module):
             num_heads=cfg["n_heads"],
             dropout=cfg["drop_rate"],
             qkv_bias=cfg["qkv_bias"],
-            kv_window_size=(
-                cfg["kv_window_size"]
-                if "kv_window_size" in cfg
-                else cfg["context_length"]
-            ),
+            kv_window_size=cfg["kv_window_size"],
         )
         self.ff = FeedForward(cfg)
         self.norm1 = LayerNorm(cfg["emb_dim"])
         self.norm2 = LayerNorm(cfg["emb_dim"])
         self.drop_shortcut = nn.Dropout(cfg["drop_rate"])
 
-    def forward(self, x: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Shortcut connection for attention block
         shortcut = x
         x = self.norm1(x)
 
-        x = self.att(x, use_cache=use_cache)
+        x = self.att(x)
 
         x = self.drop_shortcut(x)
         x = x + shortcut  # Add the original input back
@@ -246,27 +247,24 @@ class GPTModel(nn.Module):
         self.final_norm = LayerNorm(cfg["emb_dim"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
 
-    def forward(self, in_idx: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
+    def forward(self, in_idx: torch.Tensor) -> torch.Tensor:
         _, seq_len = in_idx.shape
         tok_embeds = self.tok_emb(in_idx)
 
-        if use_cache:
-            pos_ids = torch.arange(
-                self.ptr_current_pos,
-                self.ptr_current_pos + seq_len,
-                device=in_idx.device,
-                dtype=torch.long,
-            )
-            self.ptr_current_pos += seq_len
-        else:
-            pos_ids = torch.arange(0, seq_len, device=in_idx.device, dtype=torch.long)
+        pos_ids = torch.arange(
+            self.ptr_current_pos,
+            self.ptr_current_pos + seq_len,
+            device=in_idx.device,
+            dtype=torch.long,
+        )
+        self.ptr_current_pos += seq_len
         pos_embeds = self.pos_emb(pos_ids).unsqueeze(0)
 
         x = tok_embeds + pos_embeds  # Shape [batch_size, num_tokens, emb_size]
         x = self.drop_emb(x)
 
         for blk in self.trf_blocks:
-            x = blk(x, use_cache=use_cache)
+            x = blk(x)
 
         x = self.final_norm(x)
         logits = self.out_head(x)
@@ -283,28 +281,21 @@ def generate_text_simple_cached(
     idx: torch.Tensor,
     max_new_tokens: int,
     context_size: typing.Optional[int] = None,
-    use_cache: bool = True,
 ) -> torch.Tensor:
     """Generate `max_new_tokens` new tokens autoregressively, starting from the
-    prompt token indices `idx`, optionally using the model's KV cache."""
+    prompt token indices `idx` using the model's KV cache."""
     model.eval()
 
     ctx_len = context_size or model.pos_emb.num_embeddings
 
     with torch.no_grad():
-        if use_cache:
-            model.reset_kv_cache()
-            logits = model(idx[:, -ctx_len:], use_cache=True)
+        model.reset_kv_cache()
+        logits = model(idx[:, -ctx_len:])
 
-            for _ in range(max_new_tokens):
-                next_idx = logits[:, -1].argmax(dim=-1, keepdim=True)
-                idx = torch.cat([idx, next_idx], dim=1)
-                logits = model(next_idx, use_cache=True)
-        else:
-            for _ in range(max_new_tokens):
-                logits = model(idx[:, -ctx_len:], use_cache=False)
-                next_idx = logits[:, -1].argmax(dim=-1, keepdim=True)
-                idx = torch.cat([idx, next_idx], dim=1)
+        for _ in range(max_new_tokens):
+            next_idx = logits[:, -1].argmax(dim=-1, keepdim=True)
+            idx = torch.cat([idx, next_idx], dim=1)
+            logits = model(next_idx)
 
     return idx
 
