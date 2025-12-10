@@ -6,11 +6,13 @@ import torch
 import torch.nn as nn
 from torch import cuda
 
+import attention_helpers
+
 # Reference KV-cache implementation adapted from
 # https://github.com/rasbt/LLMs-from-scratch
 
 
-class MultiHeadAttention(nn.Module):
+class MultiHeadAttention(attention_helpers.MultiHeadAttentionBase):
     def __init__(
         self,
         d_in: int,
@@ -22,20 +24,14 @@ class MultiHeadAttention(nn.Module):
         max_seq_len: typing.Optional[int] = None,
         kv_window_size: typing.Optional[int] = None,
     ) -> None:
-        super().__init__()
-        assert d_out % num_heads == 0, "d_out must be divisible by num_heads"
-
-        self.d_out = d_out
-        self.num_heads = num_heads
-        # Reduce the projection dim to match desired output dim
-        self.head_dim = d_out // num_heads
-
-        self.W_query = nn.Linear(d_in, d_out, bias=qkv_bias)
-        self.W_key = nn.Linear(d_in, d_out, bias=qkv_bias)
-        self.W_value = nn.Linear(d_in, d_out, bias=qkv_bias)
-        self.out_proj = nn.Linear(d_out, d_out)  # Linear layer to combine head outputs
-        self.dropout = nn.Dropout(dropout)
-
+        super().__init__(
+            d_in=d_in,
+            d_out=d_out,
+            context_length=context_length,
+            dropout=dropout,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+        )
         self.max_seq_len = max_seq_len or context_length
         # Maximum number of past time steps (tokens) to keep in the KV cache
         # per head; older entries are dropped once this sliding window is full.
@@ -46,25 +42,12 @@ class MultiHeadAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, num_new_tokens, _ = x.shape
 
-        keys_new = self.W_key(x)  # Shape: (b, num_new_tokens, d_out)
-        values_new = self.W_value(x)
-        queries = self.W_query(x)
+        # Use the shared projection helper to obtain per-head Q, K, V in (b, num_heads,
+        # num_new_tokens, head_dim) layout.
+        queries, keys_new, values_new = self._project_qkv(x)
 
-        # We implicitly split the matrix by adding a `num_heads` dimension Unroll last
-        # dim: (b, num_new_tokens, d_out) -> (b, num_new_tokens, num_heads, head_dim)
-        keys_new = keys_new.view(b, num_new_tokens, self.num_heads, self.head_dim)
-        values_new = values_new.view(b, num_new_tokens, self.num_heads, self.head_dim)
-        queries = queries.view(b, num_new_tokens, self.num_heads, self.head_dim)
-
-        # Transpose: (b, num_new_tokens, num_heads, head_dim) -> (b, num_heads,
-        # num_new_tokens, head_dim)
-        keys_new = keys_new.transpose(1, 2)
-        values_new = values_new.transpose(1, 2)
-        queries = queries.transpose(1, 2)
-
-        # Always use the KV cache path: append the new keys/values into the
-        # fixed-size sliding window buffer, dropping the oldest entries if
-        # necessary.
+        # Always use the KV cache path: append the new keys/values into the fixed-size
+        # sliding window buffer, dropping the oldest entries if necessary.
         if self.cache_k is None or self.cache_k.size(0) != b:
             self.cache_k = torch.zeros(
                 b, self.num_heads, self.kv_window_size, self.head_dim, device=x.device
@@ -111,20 +94,20 @@ class MultiHeadAttention(nn.Module):
             )
         else:
             # Cached case: we only have `num_tokens` fresh queries, but there are
-            # `num_keys` keys in total. The first (num_keys - num_tokens) keys come
-            # from earlier timesteps stored in the KV cache, so each query i in this
-            # chunk corresponds to a *global* position (offset + i), where offset =
-            # number of cached tokens before this chunk.
+            # `num_keys` keys in total. The first (num_keys - num_tokens) keys come from
+            # earlier timesteps stored in the KV cache, so each query i in this chunk
+            # corresponds to a *global* position (offset + i), where offset = number of
+            # cached tokens before this chunk.
             #
-            # A key at column j is in the "future" of query (offset + i) if
-            # j > offset + i, which we encode via the inequality below.
+            # A key at column j is in the "future" of query (offset + i) if j > offset +
+            # i, which we encode via the inequality below.
             offset = num_keys - num_new_tokens
             # Row indices i = 0..num_new_tokens-1, shaped (num_new_tokens, 1)
             row_idx = torch.arange(num_new_tokens, device=x.device).unsqueeze(1)
             # Column indices j = 0..num_keys-1, shaped (1, num_keys)
             col_idx = torch.arange(num_keys, device=x.device).unsqueeze(0)
-            # True wherever j > offset + i, i.e., where the key would be a
-            # "future" position for this query and must be masked out.
+            # True wherever j > offset + i, i.e., where the key would be a "future"
+            # position for this query and must be masked out.
             causal_mask = row_idx + offset < col_idx
 
         # Use the mask to fill attention scores
@@ -133,65 +116,15 @@ class MultiHeadAttention(nn.Module):
         attn_weights = torch.softmax(attn_scores / keys.shape[-1] ** 0.5, dim=-1)
         attn_weights = self.dropout(attn_weights)
 
-        # Shape: (b, num_tokens, num_heads, head_dim)
-        context_vec = (attn_weights @ values).transpose(1, 2)
+        # Shape: (b, num_new_tokens, num_heads, head_dim) after transpose
+        context = (attn_weights @ values).transpose(1, 2)
 
         # Combine heads, where self.d_out = self.num_heads * self.head_dim
-        context_vec = context_vec.contiguous().view(b, num_new_tokens, self.d_out)
-        context_vec = self.out_proj(context_vec)  # optional projection
-
-        return context_vec
+        context = context.contiguous().view(b, num_new_tokens, self.d_out)
+        return self.out_proj(context)
 
     def reset_cache(self) -> None:
         self.cache_k, self.cache_v = None, None
-
-
-#####################################
-# Chapter 4
-#####################################
-class LayerNorm(nn.Module):
-    def __init__(self, emb_dim: int) -> None:
-        super().__init__()
-        self.eps = 1e-5
-        self.scale = nn.Parameter(torch.ones(emb_dim))
-        self.shift = nn.Parameter(torch.zeros(emb_dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mean = x.mean(dim=-1, keepdim=True)
-        var = x.var(dim=-1, keepdim=True, unbiased=False)
-        norm_x = (x - mean) / torch.sqrt(var + self.eps)
-        return self.scale * norm_x + self.shift
-
-
-class GELU(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (
-            0.5
-            * x
-            * (
-                1
-                + torch.tanh(
-                    torch.sqrt(torch.tensor(2.0 / torch.pi))
-                    * (x + 0.044715 * torch.pow(x, 3))
-                )
-            )
-        )
-
-
-class FeedForward(nn.Module):
-    def __init__(self, cfg: dict[str, typing.Any]) -> None:
-        super().__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(cfg["emb_dim"], 4 * cfg["emb_dim"]),
-            GELU(),
-            nn.Linear(4 * cfg["emb_dim"], cfg["emb_dim"]),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layers(x)
 
 
 class TransformerBlock(nn.Module):
@@ -206,18 +139,16 @@ class TransformerBlock(nn.Module):
             qkv_bias=cfg["qkv_bias"],
             kv_window_size=cfg["kv_window_size"],
         )
-        self.ff = FeedForward(cfg)
-        self.norm1 = LayerNorm(cfg["emb_dim"])
-        self.norm2 = LayerNorm(cfg["emb_dim"])
+        self.ff = attention_helpers.FeedForward(cfg)
+        self.norm1 = attention_helpers.LayerNorm(cfg["emb_dim"])
+        self.norm2 = attention_helpers.LayerNorm(cfg["emb_dim"])
         self.drop_shortcut = nn.Dropout(cfg["drop_rate"])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Shortcut connection for attention block
         shortcut = x
         x = self.norm1(x)
-
         x = self.att(x)
-
         x = self.drop_shortcut(x)
         x = x + shortcut  # Add the original input back
 
@@ -244,7 +175,7 @@ class GPTModel(nn.Module):
 
         self.ptr_current_pos = 0
 
-        self.final_norm = LayerNorm(cfg["emb_dim"])
+        self.final_norm = attention_helpers.LayerNorm(cfg["emb_dim"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
 
     def forward(self, in_idx: torch.Tensor) -> torch.Tensor:

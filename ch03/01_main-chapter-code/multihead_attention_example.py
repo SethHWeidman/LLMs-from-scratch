@@ -1,36 +1,7 @@
 import torch
 from torch import nn
 
-
-def create_demo_batch() -> torch.Tensor:
-    """Create a fixed demo batch of shape (2, 6, 3).
-
-    Values are taken from a torch RNG run with `torch.manual_seed(251128)` and then
-    rounded to 2 decimals.
-    """
-
-    inputs = torch.tensor(
-        [
-            [
-                [0.19, 0.28, 0.63],
-                [0.33, 0.61, 0.36],
-                [0.38, 0.99, 0.60],
-                [0.56, 0.24, 0.57],
-                [0.88, 0.92, 0.81],
-                [0.06, 0.97, 0.39],
-            ],
-            [
-                [0.64, 0.56, 0.78],
-                [0.02, 0.74, 0.51],
-                [0.03, 0.69, 0.76],
-                [0.70, 0.42, 0.07],
-                [0.64, 0.78, 0.61],
-                [0.75, 0.11, 0.73],
-            ],
-        ],
-        dtype=torch.float32,
-    )
-    return inputs
+import attention_helpers
 
 
 class SingleHeadAttention(nn.Module):
@@ -71,7 +42,7 @@ class SingleHeadAttention(nn.Module):
         return context_vec
 
 
-class MultiHeadAttention(nn.Module):
+class MultiHeadAttention(attention_helpers.MultiHeadAttentionBase):
     def __init__(
         self,
         d_in: int,
@@ -81,74 +52,25 @@ class MultiHeadAttention(nn.Module):
         num_heads: int,
         qkv_bias: bool = False,
     ) -> None:
-        super().__init__()
-        if d_out % num_heads != 0:
-            msg = "d_out must be divisible by num_heads"
-            raise ValueError(msg)
-
-        self.d_out = d_out
-        self.num_heads = num_heads
-        self.head_dim = d_out // num_heads
-
-        self.W_query = nn.Linear(d_in, d_out, bias=qkv_bias)
-        self.W_key = nn.Linear(d_in, d_out, bias=qkv_bias)
-        self.W_value = nn.Linear(d_in, d_out, bias=qkv_bias)
-        self.out_proj = nn.Linear(d_out, d_out)
-        self.dropout = nn.Dropout(dropout)
-        self.register_buffer(
-            "mask", torch.triu(torch.ones(context_length, context_length), diagonal=1)
+        super().__init__(
+            d_in=d_in,
+            d_out=d_out,
+            context_length=context_length,
+            dropout=dropout,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, num_tokens, _ = x.shape
-
-        keys = self.W_key(x)
-        queries = self.W_query(x)
-        values = self.W_value(x)
-
-        keys = keys.view(b, num_tokens, self.num_heads, self.head_dim)
-        queries = queries.view(b, num_tokens, self.num_heads, self.head_dim)
-        values = values.view(b, num_tokens, self.num_heads, self.head_dim)
-
-        # the code below sets up the remainder of the computations to be done
-        # "head-wise"; each head does its own operations with keys, queries, and values.
-        # Last two dimensions of each of these Tensors are now [num_tokens,
-        # self.head_dim]
-        keys = keys.transpose(1, 2)
-        queries = queries.transpose(1, 2)
-        values = values.transpose(1, 2)
-
-        # queries, keys: (b, num_heads, num_tokens, head_dim)
-        # keys.transpose(2, 3): (b, num_heads, head_dim, num_tokens)
-        # Batched Q K^T per (batch, head), yielding
-        #   attn_scores: (b, num_heads, num_tokens, num_tokens)
-        # with attn_scores[b, h, i, j] = q_i · k_j.
-        attn_scores = queries @ keys.transpose(2, 3)
-        mask_bool = self.mask.bool()[:num_tokens, :num_tokens]
-        attn_scores.masked_fill_(mask_bool, -torch.inf)
-
-        # Softmax over the last dimension means that for each (batch, head, query i),
-        # attn_scores[b, h, i, :] is normalized into a per-head distribution over keys j.
-        attn_weights = torch.softmax(attn_scores / keys.shape[-1] ** 0.5, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
-        # at this point, we have an "num_tokens x self.head_dim" matrix of context
-        # vectors in each head. `context_vectors` is [b, self.num_heads, num_tokens,
-        # self.head_dim]
-        context_vectors = attn_weights @ values
-
-        # finally combine the results from all the heads. `.transpose(1, 2)` changes
-        # `context_vectors` to have shape [b, num_tokens, self.num_heads, self.head_dim]
-        context_vectors = (
-            context_vectors.transpose(1, 2).contiguous().view(b, num_tokens, self.d_out)
-        )
+        queries, keys, values = self._project_qkv(x)
+        context_vectors = self._compute_context_vectors(queries, keys, values)
         output_vectors = self.out_proj(context_vectors)
         return output_vectors
 
 
 def run_demo() -> None:
     torch.manual_seed(251128)
-    batch = create_demo_batch()
+    batch = torch.rand((2, 6, 3), dtype=torch.float32)
     batch_size, seq_len, d_in = batch.shape
     context_length = seq_len
     d_out = 4  # output feature dimension

@@ -9,7 +9,8 @@
 import pathlib
 
 import torch
-from torch import nn
+from torch import cuda, nn
+from torch.backends import mps
 
 
 def _section(title: str) -> None:
@@ -17,23 +18,6 @@ def _section(title: str) -> None:
 
     bar = "=" * len(title)
     print(f"\n{bar}\n{title}\n{bar}")
-
-
-def build_demo_batch() -> torch.Tensor:
-    """Create the small batch from the notebook (two identical sequences)."""
-
-    inputs = torch.tensor(
-        [
-            [0.43, 0.15, 0.89],  # "Your"
-            [0.55, 0.87, 0.66],  # "journey"
-            [0.57, 0.85, 0.64],  # "starts"
-            [0.22, 0.58, 0.33],  # "with"
-            [0.77, 0.25, 0.10],  # "one"
-            [0.05, 0.80, 0.55],  # "step"
-        ],
-        dtype=torch.float32,
-    )
-    return torch.stack((inputs, inputs), dim=0)
 
 
 class BaseCausalAttention(nn.Module):
@@ -122,8 +106,8 @@ class CausalAttentionWithBuffer(BaseCausalAttention):
 def _pick_device() -> tuple[torch.device, bool]:
     """Choose the 'best' available device and indicate if it is actually a GPU."""
 
-    has_cuda = torch.cuda.is_available()
-    has_mps = getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+    has_cuda = cuda.is_available()
+    has_mps = getattr(torch.backends, "mps", None) and mps.is_available()
 
     if has_cuda:
         device = torch.device("cuda")
@@ -137,12 +121,23 @@ def _pick_device() -> tuple[torch.device, bool]:
 
 def main() -> None:
     torch.manual_seed(251201)
-    demo_batch = build_demo_batch()
+    inputs = torch.tensor(
+        [
+            [0.43, 0.15, 0.89],  # "Your"
+            [0.55, 0.87, 0.66],  # "journey"
+            [0.57, 0.85, 0.64],  # "starts"
+            [0.22, 0.58, 0.33],  # "with"
+            [0.77, 0.25, 0.10],  # "one"
+            [0.05, 0.80, 0.55],  # "step"
+        ],
+        dtype=torch.float32,
+    )
+    demo_batch = torch.stack((inputs, inputs), dim=0)
     batch_size, seq_len, d_in = demo_batch.shape
     d_out = 2
     print(f"Demo batch shape: {demo_batch.shape} (batch={batch_size}, tokens={seq_len})")
 
-    section("Causal attention without buffers (CPU run)")
+    _section("Causal attention without buffers (CPU run)")
     ca_no_buffer = CausalAttentionWithoutBuffers(
         d_in=d_in, d_out=d_out, context_length=seq_len, dropout=0.0
     )
@@ -151,7 +146,7 @@ def main() -> None:
     print("Context vectors (CPU, no buffers):")
     print(cpu_context)
 
-    section("Moving module to GPU without buffers")
+    _section("Moving module to GPU without buffers")
     device, has_gpu = _pick_device()
     print(f"Selected device: {device} (GPU available: {has_gpu})")
 
