@@ -81,6 +81,19 @@ class GroupedQueryAttention(nn.Module):
         num_tokens_q = queries.shape[-2]
         num_tokens_k = keys.shape[-2]
         device = queries.device
+
+        # Causal Masking with a KV Cache
+        # ------------------------------
+        # To mask correctly, we must align the Query and Key tensors using their
+        # "Absolute Positions" in the full text sequence.
+        #
+        # 1. Queries: The new tokens start at `self.ptr_current_pos`.
+        #
+        # 2. Keys: In this infinite-cache implementation, the cache always begins
+        #    at Absolute Position 0.
+        #
+        #    (Note: If we were using a sliding window, we would calculate the start
+        #    position as `total_tokens_processed - current_cache_size`).
         q_positions = torch.arange(
             self.ptr_current_pos,
             self.ptr_current_pos + num_tokens_q,
