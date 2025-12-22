@@ -7,6 +7,7 @@ import torch.nn as nn
 from torch import cuda
 
 import attention_helpers
+import gpt_reference_helpers
 
 # Reference KV-cache implementation adapted from
 # https://github.com/rasbt/LLMs-from-scratch
@@ -44,7 +45,7 @@ class MultiHeadAttention(attention_helpers.MultiHeadAttentionBase):
 
         # Use the shared projection helper to obtain per-head Q, K, V in (b, num_heads,
         # num_new_tokens, head_dim) layout.
-        queries, keys_new, values_new = self._project_qkv(x)
+        queries, keys_new, values_new = self.project_qkv(x)
 
         # Always use the KV cache path: append the new keys/values into the fixed-size
         # sliding window buffer, dropping the oldest entries if necessary.
@@ -127,108 +128,20 @@ class MultiHeadAttention(attention_helpers.MultiHeadAttentionBase):
         self.cache_k, self.cache_v = None, None
 
 
-class TransformerBlock(nn.Module):
-    def __init__(self, cfg: dict[str, typing.Any]) -> None:
-        super().__init__()
-        self.att = MultiHeadAttention(
-            d_in=cfg["emb_dim"],
-            d_out=cfg["emb_dim"],
-            context_length=cfg["context_length"],
-            num_heads=cfg["n_heads"],
-            dropout=cfg["drop_rate"],
-            qkv_bias=cfg["qkv_bias"],
-            kv_window_size=cfg["kv_window_size"],
-        )
-        self.ff = attention_helpers.FeedForward(cfg)
-        self.norm1 = attention_helpers.LayerNorm(cfg["emb_dim"])
-        self.norm2 = attention_helpers.LayerNorm(cfg["emb_dim"])
-        self.drop_shortcut = nn.Dropout(cfg["drop_rate"])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Shortcut connection for attention block
-        shortcut = x
-        x = self.norm1(x)
-        x = self.att(x)
-        x = self.drop_shortcut(x)
-        x = x + shortcut  # Add the original input back
-
-        # Shortcut connection for feed-forward block
-        shortcut = x
-        x = self.norm2(x)
-        x = self.ff(x)
-        x = self.drop_shortcut(x)
-        x = x + shortcut  # Add the original input back
-
-        return x
-
-
-class GPTModel(nn.Module):
-    def __init__(self, cfg: dict[str, typing.Any]) -> None:
-        super().__init__()
-        self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
-        self.pos_emb = nn.Embedding(cfg["context_length"], cfg["emb_dim"])
-        self.drop_emb = nn.Dropout(cfg["drop_rate"])
-
-        self.trf_blocks = nn.ModuleList(
-            [TransformerBlock(cfg) for _ in range(cfg["n_layers"])]
-        )
-
-        self.ptr_current_pos = 0
-
-        self.final_norm = attention_helpers.LayerNorm(cfg["emb_dim"])
-        self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
-
-    def forward(self, in_idx: torch.Tensor) -> torch.Tensor:
-        _, seq_len = in_idx.shape
-        tok_embeds = self.tok_emb(in_idx)
-
-        pos_ids = torch.arange(
-            self.ptr_current_pos,
-            self.ptr_current_pos + seq_len,
-            device=in_idx.device,
-            dtype=torch.long,
-        )
-        self.ptr_current_pos += seq_len
-        pos_embeds = self.pos_emb(pos_ids).unsqueeze(0)
-
-        x = tok_embeds + pos_embeds  # Shape [batch_size, num_tokens, emb_size]
-        x = self.drop_emb(x)
-
-        for blk in self.trf_blocks:
-            x = blk(x)
-
-        x = self.final_norm(x)
-        logits = self.out_head(x)
-        return logits
-
-    def reset_kv_cache(self) -> None:
-        for blk in self.trf_blocks:
-            blk.att.reset_cache()
-        self.ptr_current_pos = 0
-
-
-def generate_text_simple_cached(
-    model: GPTModel,
-    idx: torch.Tensor,
-    max_new_tokens: int,
-    context_size: typing.Optional[int] = None,
-) -> torch.Tensor:
-    """Generate `max_new_tokens` new tokens autoregressively, starting from the
-    prompt token indices `idx` using the model's KV cache."""
-    model.eval()
-
-    ctx_len = context_size or model.pos_emb.num_embeddings
-
-    with torch.no_grad():
-        model.reset_kv_cache()
-        logits = model(idx[:, -ctx_len:])
-
-        for _ in range(max_new_tokens):
-            next_idx = logits[:, -1].argmax(dim=-1, keepdim=True)
-            idx = torch.cat([idx, next_idx], dim=1)
-            logits = model(next_idx)
-
-    return idx
+def make_block(cfg: dict[str, typing.Any]) -> nn.Module:
+    att = MultiHeadAttention(
+        d_in=cfg["emb_dim"],
+        d_out=cfg["emb_dim"],
+        context_length=cfg["context_length"],
+        num_heads=cfg["n_heads"],
+        dropout=cfg["drop_rate"],
+        qkv_bias=cfg["qkv_bias"],
+        kv_window_size=cfg["kv_window_size"],
+    )
+    ff = attention_helpers.FeedForward(cfg)
+    return gpt_reference_helpers.PreNormTransformerBlock(
+        att=att, ff=ff, emb_dim=cfg["emb_dim"], drop_rate=cfg["drop_rate"]
+    )
 
 
 def main() -> None:
@@ -244,7 +157,9 @@ def main() -> None:
     }
 
     torch.manual_seed(251209)
-    model = GPTModel(GPT_CONFIG_124M)
+    model = gpt_reference_helpers.GPTReferenceModel(
+        GPT_CONFIG_124M, block_factory=make_block
+    )
     device = torch.device("cuda" if cuda.is_available() else "cpu")
     model.to(device)
     model.eval()  # disable dropout
@@ -264,7 +179,7 @@ def main() -> None:
         cuda.synchronize()
     start = time.time()
 
-    token_ids = generate_text_simple_cached(
+    token_ids = gpt_reference_helpers.generate_text_simple_cached(
         model=model, idx=encoded_tensor, max_new_tokens=200
     )
 
