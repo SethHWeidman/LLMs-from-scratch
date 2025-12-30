@@ -45,7 +45,7 @@ class MultiHeadAttention(attention_helpers.MultiHeadAttentionBase):
 
         # Use the shared projection helper to obtain per-head Q, K, V in (b, num_heads,
         # num_new_tokens, head_dim) layout.
-        queries, keys_new, values_new = self.project_qkv(x)
+        queries, keys_new, values_new = self.compute_qkv_per_head(x)
 
         # Always use the KV cache path: append the new keys/values into the fixed-size
         # sliding window buffer, dropping the oldest entries if necessary.
