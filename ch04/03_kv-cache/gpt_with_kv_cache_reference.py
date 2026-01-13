@@ -34,8 +34,8 @@ class MultiHeadAttention(attention_helpers.MultiHeadAttentionBase):
             qkv_bias=qkv_bias,
         )
         self.max_seq_len = max_seq_len or context_length
-        # Maximum number of past time steps (tokens) to keep in the KV cache
-        # per head; older entries are dropped once this sliding window is full.
+        # Maximum number of past time steps (tokens) to keep in the KV cache per head;
+        # older entries are dropped once this sliding window is full.
         self.kv_window_size = kv_window_size or self.max_seq_len
         self.register_buffer("cache_k", None, persistent=False)
         self.register_buffer("cache_v", None, persistent=False)
